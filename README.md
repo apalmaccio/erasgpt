@@ -22,14 +22,12 @@ eras-zombie-invasion
 ```
 
 ### One-Click Launchers (Downloaded or Cloned Repo)
-After installing Python 3.10+ on macOS/Linux, you can double-click the platform-specific
-launcher in the repo root. On Windows, the launcher downloads a portable Python runtime
-automatically so it is download-and-play on a standard PC. The launcher installs
-dependencies the first time it runs:
+After installing Python 3.10+ and running `pip install -e .`, you can double-click the
+platform-specific launcher in the repo root:
 
 - **macOS**: `Launch_Eras_Zombie_Invasion.command`
-- **Windows**: `Launch_Eras_Zombie_Invasion.bat` (auto-downloads Python)
-- **Linux**: `Launch_Eras_Zombie_Invasion.sh`
+- **Windows**: `Launch_Eras_Zombie_Invasion.bat`
+- **Linux**: run `python3 launch_eras_zombie_invasion.py`
 
 These launchers automatically point to the local `src/` folder so the game starts
 seamlessly from a fresh download.
