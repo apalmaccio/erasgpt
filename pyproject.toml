@@ -1,0 +1,14 @@
+[project]
+name = "eras-zombie-invasion"
+version = "0.1.0"
+description = "Standalone RTS prototype for Eras Zombie Invasion (pygame + sim)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["pygame>=2.5"]
+
+[project.scripts]
+eras-zombie-invasion = "eras_zombie_invasion.pygame_app:main"
+eras-zombie-invasion-sim = "eras_zombie_invasion.cli:main"
+
+[tool.pyproject-fmt]
+column-width = 88
