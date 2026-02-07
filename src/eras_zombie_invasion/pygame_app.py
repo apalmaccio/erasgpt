@@ -20,7 +20,11 @@ COLOR_TEXT = (220, 220, 220)
 COLOR_ACCENT = (180, 85, 120)
 COLOR_ZOMBIE = (75, 150, 110)
 COLOR_RESOURCE = (140, 110, 80)
-COLOR_LUMBER = (95, 130, 85)
+COLOR_GOLD = (200, 170, 90)
+COLOR_LUMBER = (110, 140, 90)
+COLOR_TOWER = (120, 100, 160)
+COLOR_BARRACKS = (120, 70, 55)
+COLOR_ALERT = (200, 80, 80)
 COLOR_SELECTION = (255, 210, 120)
 
 NATION_COLORS = [
@@ -55,11 +59,8 @@ class Unit:
     range: float
     cooldown: float
     target: tuple[float, float] | None = None
+    harvest_node_id: int | None = None
     cooldown_timer: float = 0.0
-    carry_type: str | None = None
-    carry_amount: float = 0.0
-    task: str = "idle"
-    harvest_target: int | None = None
 
     def update(self, dt: float) -> None:
         if self.target:
@@ -115,6 +116,16 @@ class NationState:
     def update_food_cap(self) -> None:
         depot_bonus = sum(1 for building in self.buildings if building[0] == "depot") * 6
         self.resources.food = max(self.resources.food, 12 + depot_bonus)
+    ai_controlled: bool = True
+    tech_tier: int = 1
+    buildings: list["Building"] = field(default_factory=list)
+
+    def gather(self, dt: float, gather_bonus: float) -> None:
+        gold_rate = self.workers * 2.2 * gather_bonus
+        lumber_rate = self.workers * 1.6 * gather_bonus
+        self.resources.gold += gold_rate * dt
+        self.resources.lumber += lumber_rate * dt
+        self.resources.food = max(self.resources.food, self.workers + self.soldiers + 4)
 
     def can_afford(self, gold: float, lumber: float) -> bool:
         return self.resources.gold >= gold and self.resources.lumber >= lumber
@@ -128,12 +139,38 @@ class NationState:
 class GameSession:
     nations: list[NationState]
     zombies: list[Zombie]
+class ResourceNode:
+    node_id: int
+    x: float
+    y: float
+    kind: str
+    amount: float = 1200
+
+
+@dataclass
+class Building:
+    x: float
+    y: float
+    building_type: str
+    hp: float
+    nation_id: int
+    cooldown_timer: float = 0.0
+
+
+@dataclass
+class GameSession:
+    nations: list[NationState]
+    zombies: list[Zombie]
+    nodes: list[ResourceNode]
     selected_unit: Unit | None = None
     selected_nation: int = 0
     minute: float = 0.0
     spawn_timer: float = 0.0
     game_over: bool = False
     winner: str | None = None
+    build_mode: str | None = None
+    messages: list[str] = field(default_factory=list)
+    game_over: bool = False
 
     def living_nations(self) -> list[NationState]:
         return [nation for nation in self.nations if nation.base_hp > 0]
@@ -156,12 +193,10 @@ class GameApp:
         self.large_font = pygame.font.SysFont("consolas", 24, bold=True)
         self.session = self._create_session()
         self.running = True
-        self.resource_nodes = self._create_resource_nodes()
-        self.status_message = ""
-        self.status_timer = 0.0
 
     def _create_session(self) -> GameSession:
         nations: list[NationState] = []
+        nodes: list[ResourceNode] = []
         center = (SCREEN_WIDTH / 2, MAP_HEIGHT / 2)
         radius = min(SCREEN_WIDTH, MAP_HEIGHT) * 0.35
         for idx, blueprint in enumerate(NATIONS):
@@ -173,6 +208,9 @@ class GameApp:
                 nation_id=idx,
                 base_pos=(base_x, base_y),
                 ai_controlled=idx != 0,
+            )
+            nation.buildings.append(
+                Building(x=base_x, y=base_y, building_type="base", hp=250, nation_id=idx)
             )
             for i in range(nation.soldiers):
                 offset = 12 * i
@@ -229,6 +267,17 @@ class GameApp:
                 }
             )
         return nodes
+        node_id = 0
+        for ring in (0.2, 0.45, 0.6):
+            ring_radius = min(SCREEN_WIDTH, MAP_HEIGHT) * ring
+            for i in range(8):
+                angle = (i / 8) * math.tau + ring
+                x = center[0] + math.cos(angle) * ring_radius
+                y = center[1] + math.sin(angle) * ring_radius
+                kind = "gold" if i % 2 == 0 else "lumber"
+                nodes.append(ResourceNode(node_id=node_id, x=x, y=y, kind=kind))
+                node_id += 1
+        return GameSession(nations=nations, zombies=[], nodes=nodes)
 
     def run(self) -> None:
         while self.running:
@@ -245,15 +294,27 @@ class GameApp:
             if event.type == pygame.KEYDOWN:
                 if pygame.K_1 <= event.key <= pygame.K_8:
                     self.session.selected_nation = event.key - pygame.K_1
+                    self.session.build_mode = None
                 if event.key == pygame.K_s:
                     self._train_soldier()
                 if event.key == pygame.K_w:
                     self._train_worker()
+                if event.key == pygame.K_r:
+                    self._research_tier()
+                if event.key == pygame.K_b:
+                    self.session.build_mode = "barracks"
                 if event.key == pygame.K_d:
-                    self._build_depot()
+                    self.session.build_mode = "tower"
+                if event.key == pygame.K_ESCAPE:
+                    if self.session.game_over:
+                        self.running = False
+                    self.session.build_mode = None
             if event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
-                    self._select_unit(event.pos)
+                    if self.session.build_mode:
+                        self._place_building(event.pos)
+                    else:
+                        self._select_unit(event.pos)
                 if event.button == 3:
                     self._move_selected(event.pos)
 
@@ -268,14 +329,52 @@ class GameApp:
 
     def _move_selected(self, pos: tuple[int, int]) -> None:
         if self.session.selected_unit:
-            self.session.selected_unit.target = (float(pos[0]), float(pos[1]))
+            node = self._node_at_position(pos)
+            if node and self.session.selected_unit.unit_type == "worker":
+                self.session.selected_unit.harvest_node_id = node.node_id
+                self.session.selected_unit.target = (node.x, node.y)
+            else:
+                self.session.selected_unit.harvest_node_id = None
+                self.session.selected_unit.target = (float(pos[0]), float(pos[1]))
+
+    def _place_building(self, pos: tuple[int, int]) -> None:
+        nation = self.session.nations[self.session.selected_nation]
+        if nation.base_hp <= 0:
+            return
+        if self.session.build_mode == "barracks":
+            cost = (140, 80)
+            building_type = "barracks"
+            hp = 180
+        else:
+            cost = (120, 100)
+            building_type = "tower"
+            hp = 160
+        if not nation.can_afford(*cost):
+            self._push_message("Not enough resources.")
+            return
+        if self._too_close_to_base(pos, nation.base_pos) or self._building_at_position(pos):
+            self._push_message("Placement blocked.")
+            return
+        nation.spend(*cost)
+        nation.buildings.append(
+            Building(
+                x=float(pos[0]),
+                y=float(pos[1]),
+                building_type=building_type,
+                hp=hp,
+                nation_id=nation.nation_id,
+            )
+        )
+        self._push_message(f"{building_type.title()} constructed.")
+        self.session.build_mode = None
 
     def _train_soldier(self) -> None:
         nation = self.session.nations[self.session.selected_nation]
-        if nation.workers + nation.soldiers >= nation.resources.food:
-            self._set_status("Supply cap reached.")
+        if not any(building.building_type == "barracks" for building in nation.buildings):
+            self._push_message("Build a barracks to train soldiers.")
             return
         if not nation.can_afford(90, 30):
+            self._push_message("Not enough resources.")
             return
         nation.spend(90, 30)
         nation.soldiers += 1
@@ -293,14 +392,11 @@ class GameApp:
                 cooldown=1.1,
             )
         )
-        self._set_status("Trained soldier.")
 
     def _train_worker(self) -> None:
         nation = self.session.nations[self.session.selected_nation]
-        if nation.workers + nation.soldiers >= nation.resources.food:
-            self._set_status("Supply cap reached.")
-            return
         if not nation.can_afford(50, 15):
+            self._push_message("Not enough resources.")
             return
         nation.spend(50, 15)
         nation.workers += 1
@@ -318,20 +414,24 @@ class GameApp:
                 cooldown=1.4,
             )
         )
-        self._set_status("Trained worker.")
 
-    def _build_depot(self) -> None:
+    def _research_tier(self) -> None:
         nation = self.session.nations[self.session.selected_nation]
-        if not nation.can_afford(140, 60):
-            self._set_status("Not enough resources for depot.")
+        if nation.tech_tier >= 4:
+            self._push_message("Tech tree fully researched.")
             return
-        nation.spend(140, 60)
-        base_x, base_y = nation.base_pos
-        offset = random.uniform(-35, 35)
-        pos = (base_x + offset, base_y + offset)
-        nation.buildings.append(("depot", pos, 180))
-        nation.update_food_cap()
-        self._set_status("Built supply depot.")
+        costs = {
+            1: (280, 180),
+            2: (520, 360),
+            3: (820, 520),
+        }
+        gold, lumber = costs.get(nation.tech_tier, (0, 0))
+        if not nation.can_afford(gold, lumber):
+            self._push_message("Not enough resources.")
+            return
+        nation.spend(gold, lumber)
+        nation.tech_tier += 1
+        self._push_message(f"Tech Tier {nation.tech_tier} reached.")
 
     def _units_for_nation(self, nation_id: int) -> list[Unit]:
         return self.session.nations[nation_id].units
@@ -345,25 +445,22 @@ class GameApp:
         for idx, nation in enumerate(session.nations):
             if nation.base_hp <= 0:
                 continue
-            nation.update_food_cap()
             gather_bonus = NATIONS[idx].gather_bonus
+            nation.gather(dt, gather_bonus)
             if nation.ai_controlled:
                 self._ai_take_turn(nation, dt)
             for unit in list(nation.units):
                 unit.update(dt)
-            self._update_worker_tasks(nation, gather_bonus, dt)
+            self._harvest_with_workers(nation, dt)
+            self._update_buildings(nation, dt)
         self._update_zombies(dt)
         self._resolve_combat(dt)
-        self._check_victory()
-        if self.status_timer > 0:
-            self.status_timer = max(0.0, self.status_timer - dt)
+        self._cleanup_destroyed()
+        self._check_game_over()
 
     def _ai_take_turn(self, nation: NationState, dt: float) -> None:
-        if (
-            nation.can_afford(90, 30)
-            and nation.soldiers < 14
-            and nation.workers + nation.soldiers < nation.resources.food
-        ):
+        has_barracks = any(building.building_type == "barracks" for building in nation.buildings)
+        if has_barracks and nation.can_afford(90, 30) and nation.soldiers < 14:
             nation.spend(90, 30)
             nation.soldiers += 1
             base_x, base_y = nation.base_pos
@@ -380,11 +477,7 @@ class GameApp:
                     cooldown=1.1,
                 )
             )
-        if (
-            nation.can_afford(50, 15)
-            and nation.workers < 12
-            and nation.workers + nation.soldiers < nation.resources.food
-        ):
+        if nation.can_afford(50, 15) and nation.workers < 12:
             nation.spend(50, 15)
             nation.workers += 1
             base_x, base_y = nation.base_pos
@@ -401,12 +494,6 @@ class GameApp:
                     cooldown=1.4,
                 )
             )
-        if nation.can_afford(140, 60) and len(nation.buildings) < 3:
-            nation.spend(140, 60)
-            base_x, base_y = nation.base_pos
-            offset = random.uniform(-35, 35)
-            nation.buildings.append(("depot", (base_x + offset, base_y + offset), 180))
-            nation.update_food_cap()
         for unit in nation.units:
             if unit.unit_type == "soldier" and unit.target is None:
                 offset = random.uniform(-40, 40)
@@ -414,6 +501,34 @@ class GameApp:
                     nation.base_pos[0] + offset,
                     nation.base_pos[1] + offset,
                 )
+        if nation.tech_tier < 3 and nation.can_afford(320, 220):
+            nation.spend(320, 220)
+            nation.tech_tier += 1
+        if not any(building.building_type == "barracks" for building in nation.buildings):
+            if nation.can_afford(140, 80):
+                nation.spend(140, 80)
+                base_x, base_y = nation.base_pos
+                nation.buildings.append(
+                    Building(
+                        x=base_x + random.uniform(-60, 60),
+                        y=base_y + random.uniform(-60, 60),
+                        building_type="barracks",
+                        hp=180,
+                        nation_id=nation.nation_id,
+                    )
+                )
+        if nation.can_afford(120, 100) and len(nation.buildings) < 3:
+            base_x, base_y = nation.base_pos
+            nation.spend(120, 100)
+            nation.buildings.append(
+                Building(
+                    x=base_x + random.uniform(-90, 90),
+                    y=base_y + random.uniform(-90, 90),
+                    building_type="tower",
+                    hp=160,
+                    nation_id=nation.nation_id,
+                )
+            )
 
     def _spawn_zombies(self, dt: float) -> None:
         session = self.session
@@ -435,55 +550,6 @@ class GameApp:
             else:
                 x, y = random.uniform(SCREEN_WIDTH - 50, SCREEN_WIDTH - 10), random.uniform(0, MAP_HEIGHT)
             session.zombies.append(Zombie(x=x, y=y))
-
-    def _update_worker_tasks(self, nation: NationState, gather_bonus: float, dt: float) -> None:
-        for unit in nation.units:
-            if unit.unit_type != "worker":
-                continue
-            if unit.task == "idle":
-                node_index = self._find_closest_node(unit.x, unit.y)
-                if node_index is not None:
-                    unit.harvest_target = node_index
-                    unit.target = (self.resource_nodes[node_index]["x"], self.resource_nodes[node_index]["y"])
-                    unit.task = "gather"
-            elif unit.task == "gather":
-                if unit.harvest_target is None:
-                    unit.task = "idle"
-                    continue
-                node = self.resource_nodes[unit.harvest_target]
-                if node["amount"] <= 0:
-                    unit.task = "idle"
-                    unit.harvest_target = None
-                    continue
-                if self._distance((unit.x, unit.y), (node["x"], node["y"])) < 18:
-                    harvest = 8 * gather_bonus * dt
-                    node["amount"] = max(0, node["amount"] - harvest)
-                    unit.carry_type = node["type"]
-                    unit.carry_amount += harvest
-                    if unit.carry_amount >= 20:
-                        unit.task = "return"
-                        unit.target = nation.base_pos
-            elif unit.task == "return":
-                if self._distance((unit.x, unit.y), nation.base_pos) < 20:
-                    if unit.carry_type == "gold":
-                        nation.resources.gold += unit.carry_amount
-                    elif unit.carry_type == "lumber":
-                        nation.resources.lumber += unit.carry_amount
-                    unit.carry_amount = 0
-                    unit.carry_type = None
-                    unit.task = "idle"
-
-    def _find_closest_node(self, x: float, y: float) -> int | None:
-        best_index = None
-        best_dist = float("inf")
-        for idx, node in enumerate(self.resource_nodes):
-            if node["amount"] <= 0:
-                continue
-            dist = self._distance((x, y), (node["x"], node["y"]))
-            if dist < best_dist:
-                best_dist = dist
-                best_index = idx
-        return best_index
 
     def _update_zombies(self, dt: float) -> None:
         session = self.session
@@ -511,6 +577,11 @@ class GameApp:
             if target_unit:
                 target_unit.hp -= zombie.attack
                 zombie.cooldown_timer = zombie.cooldown
+                continue
+            target_building = self._closest_building(zombie.x, zombie.y, zombie.range)
+            if target_building:
+                target_building.hp -= zombie.attack
+                zombie.cooldown_timer = zombie.cooldown
         for nation in session.nations:
             for unit in list(nation.units):
                 if unit.hp <= 0:
@@ -526,26 +597,49 @@ class GameApp:
             for zombie in list(session.zombies):
                 if self._distance((zombie.x, zombie.y), nation.base_pos) < 22:
                     nation.base_hp = max(0, nation.base_hp - zombie.attack * dt)
-            for building in list(nation.buildings):
-                if building[0] == "depot":
-                    for zombie in list(session.zombies):
-                        if self._distance((zombie.x, zombie.y), building[1]) < 18:
-                            new_hp = max(0, building[2] - zombie.attack * dt)
-                            nation.buildings.remove(building)
-                            if new_hp > 0:
-                                nation.buildings.append((building[0], building[1], new_hp))
-                            else:
-                                nation.update_food_cap()
-                            break
+                    if nation.base_hp == 0:
+                        self._push_message(f"{nation.blueprint_name} has fallen.")
 
-    def _check_victory(self) -> None:
+    def _harvest_with_workers(self, nation: NationState, dt: float) -> None:
+        for unit in nation.units:
+            if unit.unit_type != "worker" or unit.harvest_node_id is None:
+                continue
+            node = next((n for n in self.session.nodes if n.node_id == unit.harvest_node_id), None)
+            if not node or node.amount <= 0:
+                unit.harvest_node_id = None
+                continue
+            if self._distance((unit.x, unit.y), (node.x, node.y)) < 22:
+                gathered = min(node.amount, 6 * dt)
+                node.amount -= gathered
+                if node.kind == "gold":
+                    nation.resources.gold += gathered
+                else:
+                    nation.resources.lumber += gathered
+
+    def _update_buildings(self, nation: NationState, dt: float) -> None:
+        for building in nation.buildings:
+            if building.cooldown_timer > 0:
+                building.cooldown_timer = max(building.cooldown_timer - dt, 0)
+            if building.building_type != "tower" or building.cooldown_timer > 0:
+                continue
+            target = self._closest_zombie(building.x, building.y, 140)
+            if target:
+                target.hp -= 12 + nation.tech_tier * 3
+                building.cooldown_timer = 1.2
+
+    def _cleanup_destroyed(self) -> None:
+        for nation in self.session.nations:
+            for building in list(nation.buildings):
+                if building.hp <= 0 and building.building_type != "base":
+                    nation.buildings.remove(building)
+        for node in list(self.session.nodes):
+            if node.amount <= 0:
+                self.session.nodes.remove(node)
+
+    def _check_game_over(self) -> None:
         living = self.session.living_nations()
         if len(living) <= 1:
             self.session.game_over = True
-            if living:
-                self.session.winner = living[0].blueprint_name
-            else:
-                self.session.winner = "Zombies"
 
     def _closest_zombie(self, x: float, y: float, radius: float) -> Zombie | None:
         closest = None
@@ -568,6 +662,17 @@ class GameApp:
                     closest = unit
         return closest
 
+    def _closest_building(self, x: float, y: float, radius: float) -> Building | None:
+        closest = None
+        closest_dist = radius
+        for nation in self.session.nations:
+            for building in nation.buildings:
+                dist = self._distance((x, y), (building.x, building.y))
+                if dist < closest_dist:
+                    closest_dist = dist
+                    closest = building
+        return closest
+
     @staticmethod
     def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
         return math.hypot(a[0] - b[0], a[1] - b[1])
@@ -577,14 +682,14 @@ class GameApp:
         pygame.draw.rect(self.screen, COLOR_PANEL, (0, MAP_HEIGHT, SCREEN_WIDTH, UI_HEIGHT))
         self._draw_map()
         self._draw_ui()
+        if self.session.game_over:
+            self._draw_game_over()
         pygame.display.flip()
 
     def _draw_map(self) -> None:
-        for node in self.resource_nodes:
-            if node["amount"] <= 0:
-                continue
-            color = COLOR_RESOURCE if node["type"] == "gold" else COLOR_LUMBER
-            pygame.draw.circle(self.screen, color, (int(node["x"]), int(node["y"])), 10)
+        for node in self.session.nodes:
+            color = COLOR_GOLD if node.kind == "gold" else COLOR_LUMBER
+            pygame.draw.circle(self.screen, color, (int(node.x), int(node.y)), 10)
         for idx, nation in enumerate(self.session.nations):
             if nation.base_hp <= 0:
                 continue
@@ -593,12 +698,16 @@ class GameApp:
             pygame.draw.circle(self.screen, color, (int(base_x), int(base_y)), 20)
             pygame.draw.circle(self.screen, COLOR_ACCENT, (int(base_x), int(base_y)), 24, 2)
             for building in nation.buildings:
-                if building[0] == "depot":
-                    pygame.draw.rect(
+                if building.building_type == "barracks":
+                    rect = pygame.Rect(0, 0, 24, 24)
+                    rect.center = (building.x, building.y)
+                    pygame.draw.rect(self.screen, COLOR_BARRACKS, rect)
+                elif building.building_type == "tower":
+                    pygame.draw.circle(
                         self.screen,
-                        COLOR_ACCENT,
-                        pygame.Rect(building[1][0] - 10, building[1][1] - 10, 20, 20),
-                        border_radius=2,
+                        COLOR_TOWER,
+                        (int(building.x), int(building.y)),
+                        12,
                     )
             for unit in nation.units:
                 radius = 6 if unit.unit_type == "worker" else 8
@@ -621,31 +730,69 @@ class GameApp:
         self._blit_text(header, 20, MAP_HEIGHT + 12, self.large_font)
         stats = (
             f"Gold {nation.resources.gold:,.0f}  Lumber {nation.resources.lumber:,.0f}  "
-            f"Workers {nation.workers}  Soldiers {nation.soldiers}  Base {nation.base_hp:,.0f}  "
-            f"Food {nation.workers + nation.soldiers}/{nation.resources.food}"
+            f"Workers {nation.workers}  Soldiers {nation.soldiers}  "
+            f"Base {nation.base_hp:,.0f}  Tier {nation.tech_tier}"
         )
         self._blit_text(stats, 20, MAP_HEIGHT + 44, self.font)
         phase_text = f"Zombie Phase: {phase['name']}"
         self._blit_text(phase_text, 20, MAP_HEIGHT + 70, self.font)
-        controls = "Controls: 1-8 switch nation | LMB select | RMB move | S soldier | W worker | D depot"
+        controls = (
+            "Controls: 1-8 switch | LMB select/place | RMB move/harvest | "
+            "S soldier | W worker | R tech | B barracks | D tower | Esc cancel"
+        )
         self._blit_text(controls, 20, MAP_HEIGHT + 96, self.font)
         living = len(self.session.living_nations())
         status = f"Zombies: {len(self.session.zombies)} | Nations Standing: {living}"
         self._blit_text(status, 800, MAP_HEIGHT + 44, self.font)
-        if self.status_timer > 0:
-            self._blit_text(self.status_message, 800, MAP_HEIGHT + 70, self.font)
-        if self.session.game_over:
-            winner = self.session.winner or "None"
-            end_text = f"Game Over - Winner: {winner}"
-            self._blit_text(end_text, 800, MAP_HEIGHT + 96, self.large_font)
+        if self.session.build_mode:
+            self._blit_text(
+                f"Build Mode: {self.session.build_mode.title()}",
+                800,
+                MAP_HEIGHT + 70,
+                self.font,
+                color=COLOR_ALERT,
+            )
+        self._draw_messages()
 
-    def _set_status(self, message: str) -> None:
-        self.status_message = message
-        self.status_timer = 3.0
+    def _draw_game_over(self) -> None:
+        overlay = pygame.Surface((SCREEN_WIDTH, MAP_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((10, 10, 12, 210))
+        self.screen.blit(overlay, (0, 0))
+        living = self.session.living_nations()
+        message = "Zombies consumed the realm." if not living else f"{living[0].blueprint_name} wins!"
+        self._blit_text(message, 420, MAP_HEIGHT / 2 - 20, self.large_font)
+        self._blit_text("Press Esc to exit.", 470, MAP_HEIGHT / 2 + 10, self.font)
 
-    def _blit_text(self, text: str, x: int, y: int, font: pygame.font.Font) -> None:
-        surface = font.render(text, True, COLOR_TEXT)
+    def _draw_messages(self) -> None:
+        base_y = MAP_HEIGHT + 10
+        for idx, message in enumerate(self.session.messages[-3:]):
+            self._blit_text(message, 800, base_y + idx * 20, self.font, color=COLOR_ALERT)
+
+    def _blit_text(
+        self, text: str, x: float, y: float, font: pygame.font.Font, color: tuple[int, int, int] = COLOR_TEXT
+    ) -> None:
+        surface = font.render(text, True, color)
         self.screen.blit(surface, (x, y))
+
+    def _push_message(self, message: str) -> None:
+        self.session.messages.append(message)
+
+    def _node_at_position(self, pos: tuple[int, int]) -> ResourceNode | None:
+        for node in self.session.nodes:
+            if self._distance(pos, (node.x, node.y)) < 16:
+                return node
+        return None
+
+    def _building_at_position(self, pos: tuple[int, int]) -> bool:
+        for nation in self.session.nations:
+            for building in nation.buildings:
+                if self._distance(pos, (building.x, building.y)) < 20:
+                    return True
+        return False
+
+    @staticmethod
+    def _too_close_to_base(pos: tuple[int, int], base: tuple[float, float]) -> bool:
+        return math.hypot(pos[0] - base[0], pos[1] - base[1]) < 40
 
 
 def main() -> None:

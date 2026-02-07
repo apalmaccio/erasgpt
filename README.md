@@ -21,13 +21,27 @@ pip install -e .
 eras-zombie-invasion
 ```
 
+### One-Click Launchers (Downloaded or Cloned Repo)
+After installing Python 3.10+ and running `pip install -e .`, you can double-click the
+platform-specific launcher in the repo root:
+
+- **macOS**: `Launch_Eras_Zombie_Invasion.command`
+- **Windows**: `Launch_Eras_Zombie_Invasion.bat`
+- **Linux**: run `python3 launch_eras_zombie_invasion.py`
+
+These launchers automatically point to the local `src/` folder so the game starts
+seamlessly from a fresh download.
+
 ### Controls
 - **1–8**: Switch active nation (all nations are controllable).
 - **Left click**: Select a unit belonging to the active nation.
-- **Right click**: Move the selected unit.
-- **S**: Train a soldier for the active nation.
-- **W**: Train a worker for the active nation.
-- **D**: Build a supply depot to increase the unit cap.
+- **Right click**: Move the selected unit or assign workers to resource nodes.
+- **S**: Train a soldier (requires a barracks).
+- **W**: Train a worker.
+- **R**: Research next tech tier.
+- **B**: Enter barracks build mode (left click to place).
+- **D**: Enter tower build mode (left click to place).
+- **Esc**: Cancel build mode or exit after game over.
 
 ## Simulation Prototype
 Run the text simulation to iterate on balance and AI tuning:
