@@ -14,23 +14,20 @@ Eras Zombie Invasion is a standalone multiplayer real-time strategy game inspire
 - `src/eras_zombie_invasion/` — Python simulation prototype for the RTS loop.
 
 ## Quick Start (Playable Prototype)
-The playable prototype is built with pygame. Install dependencies and launch:
-
-```bash
-pip install -e .
-eras-zombie-invasion
-```
-
-### One-Click Launchers (Downloaded or Cloned Repo)
-After installing Python 3.10+ and running `pip install -e .`, you can double-click the
-platform-specific launcher in the repo root:
+The playable prototype is built with pygame and now supports one-click bootstrapping.
+Double-click the launcher for your platform and it will create a local `.venv`,
+install dependencies, and start the game automatically:
 
 - **macOS**: `Launch_Eras_Zombie_Invasion.command`
 - **Windows**: `Launch_Eras_Zombie_Invasion.bat`
 - **Linux**: run `python3 launch_eras_zombie_invasion.py`
 
-These launchers automatically point to the local `src/` folder so the game starts
-seamlessly from a fresh download.
+If you prefer installing manually:
+
+```bash
+pip install -e .
+eras-zombie-invasion
+```
 
 ### Controls
 - **1–8**: Switch active nation (all nations are controllable).
@@ -41,6 +38,9 @@ seamlessly from a fresh download.
 - **R**: Research next tech tier.
 - **B**: Enter barracks build mode (left click to place).
 - **D**: Enter tower build mode (left click to place).
+- **Q**: Trigger the hero battle cry (buffs nearby units).
+- **M**: Toggle background music.
+- **P**: Pause/unpause.
 - **Esc**: Cancel build mode or exit after game over.
 
 ## Simulation Prototype
