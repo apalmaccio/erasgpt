@@ -29,8 +29,28 @@ def _ensure_venv(repo_root: Path) -> Path:
 
 def _install_requirements(python_path: Path, repo_root: Path) -> None:
     print("[Eras Zombie Invasion] Installing dependencies...")
-    subprocess.check_call([str(python_path), "-m", "pip", "install", "--upgrade", "pip"])
-    subprocess.check_call([str(python_path), "-m", "pip", "install", "-e", str(repo_root)])
+    subprocess.check_call(
+        [str(python_path), "-m", "pip", "install", "--upgrade", "pip"],
+        cwd=str(repo_root),
+    )
+    subprocess.check_call(
+        [str(python_path), "-m", "pip", "install", "-e", str(repo_root)],
+        cwd=str(repo_root),
+    )
+
+
+def _can_run_game(python_path: Path, repo_root: Path) -> bool:
+    """Return True if pygame and the game module are importable."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo_root / "src")
+    result = subprocess.run(
+        [str(python_path), "-c", "import pygame; import eras_zombie_invasion"],
+        cwd=str(repo_root),
+        env=env,
+        capture_output=True,
+        timeout=30,
+    )
+    return result.returncode == 0
 
 
 def main() -> None:
@@ -38,8 +58,16 @@ def main() -> None:
     src_root = repo_root / "src"
 
     if os.environ.get("ERAS_BOOTSTRAPPED") != "1":
+        print("[Eras Zombie Invasion] Checking setup (first launch may install dependencies)...")
         python_path = _ensure_venv(repo_root)
         _install_requirements(python_path, repo_root)
+        if not _can_run_game(python_path, repo_root):
+            print("[Eras Zombie Invasion] Verifying install failed, retrying install...")
+            _install_requirements(python_path, repo_root)
+            if not _can_run_game(python_path, repo_root):
+                print("[Eras Zombie Invasion] Setup failed. Please ensure Python 3.10+ and internet are available.")
+                input("Press Enter to close.")
+                sys.exit(1)
         env = os.environ.copy()
         env["ERAS_BOOTSTRAPPED"] = "1"
         subprocess.check_call([str(python_path), str(__file__)], env=env)
