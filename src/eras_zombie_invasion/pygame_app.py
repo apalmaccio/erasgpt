@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import random
+import select
+import socket
 from array import array
 from dataclasses import dataclass, field
 
@@ -15,6 +18,8 @@ SCREEN_HEIGHT = 720
 UI_HEIGHT = 170
 MAP_HEIGHT = SCREEN_HEIGHT - UI_HEIGHT
 FPS = 60
+MAX_PLAYERS = 4
+NETWORK_PORT = 5050
 
 COLOR_BG = (16, 14, 22)
 COLOR_PANEL = (28, 25, 35)
@@ -96,6 +101,146 @@ ZOMBIE_VARIANTS = {
 
 
 @dataclass
+class LobbySlot:
+    slot_id: int
+    nation_id: int
+    status: str = "open"
+    ready: bool = False
+    player_name: str = "Open"
+    connection_id: int | None = None
+
+
+@dataclass
+class LobbyState:
+    slots: list[LobbySlot]
+    active_slot: int = 0
+    info_message: str = "Host or join to begin."
+    ip_input: str = ""
+    name_input: str = "Player"
+
+
+class NetworkSession:
+    def __init__(self) -> None:
+        self.role: str | None = None
+        self.server: socket.socket | None = None
+        self.socket: socket.socket | None = None
+        self.clients: dict[int, socket.socket] = {}
+        self.recv_buffers: dict[socket.socket, str] = {}
+        self.inbox: list[dict] = []
+        self.next_client_id = 1
+
+    def host(self, port: int) -> None:
+        self.role = "host"
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind(("0.0.0.0", port))
+        self.server.listen()
+        self.server.setblocking(False)
+
+    def join(self, host: str, port: int) -> None:
+        self.role = "client"
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setblocking(False)
+        self.socket.connect_ex((host, port))
+
+    def close(self) -> None:
+        if self.server:
+            self.server.close()
+        if self.socket:
+            self.socket.close()
+        for client in self.clients.values():
+            client.close()
+        self.server = None
+        self.socket = None
+        self.clients.clear()
+        self.recv_buffers.clear()
+        self.inbox.clear()
+        self.role = None
+
+    def poll(self) -> None:
+        sockets: list[socket.socket] = []
+        if self.server:
+            sockets.append(self.server)
+        if self.socket:
+            sockets.append(self.socket)
+        sockets.extend(self.clients.values())
+        if not sockets:
+            return
+        readable, _, _ = select.select(sockets, [], [], 0)
+        for sock in readable:
+            if sock is self.server:
+                self._accept_client()
+            else:
+                self._receive(sock)
+
+    def _accept_client(self) -> None:
+        if not self.server:
+            return
+        try:
+            client, _ = self.server.accept()
+        except BlockingIOError:
+            return
+        client.setblocking(False)
+        client_id = self.next_client_id
+        self.next_client_id += 1
+        self.clients[client_id] = client
+        self.recv_buffers[client] = ""
+        self.inbox.append({"type": "client_joined", "client_id": client_id})
+
+    def _receive(self, sock: socket.socket) -> None:
+        try:
+            data = sock.recv(4096)
+        except BlockingIOError:
+            return
+        if not data:
+            self._disconnect(sock)
+            return
+        buffer = self.recv_buffers.get(sock, "") + data.decode("utf-8")
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            if not line.strip():
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            message["_socket"] = sock
+            self.inbox.append(message)
+        self.recv_buffers[sock] = buffer
+
+    def _disconnect(self, sock: socket.socket) -> None:
+        sock.close()
+        self.recv_buffers.pop(sock, None)
+        if self.socket is sock:
+            self.socket = None
+        else:
+            client_id = next((cid for cid, csock in self.clients.items() if csock is sock), None)
+            if client_id is not None:
+                self.clients.pop(client_id, None)
+                self.inbox.append({"type": "client_left", "client_id": client_id})
+
+    def send(self, message: dict, target: socket.socket | None = None) -> None:
+        data = (json.dumps(message) + "\n").encode("utf-8")
+        if target:
+            try:
+                target.sendall(data)
+            except OSError:
+                self._disconnect(target)
+            return
+        if self.role == "client" and self.socket:
+            try:
+                self.socket.sendall(data)
+            except OSError:
+                self._disconnect(self.socket)
+            return
+        if self.role == "host":
+            for client in list(self.clients.values()):
+                try:
+                    client.sendall(data)
+                except OSError:
+                    self._disconnect(client)
+
+@dataclass
 class Resources:
     gold: float = 500
     lumber: float = 320
@@ -109,6 +254,7 @@ class Unit:
     y: float
     unit_type: str
     nation_id: int
+    unit_id: int
     hp: float
     speed: float
     attack: float
@@ -116,6 +262,9 @@ class Unit:
     cooldown: float
     target: tuple[float, float] | None = None
     harvest_node_id: int | None = None
+    order_type: str | None = None
+    order_target_id: int | None = None
+    order_pos: tuple[float, float] | None = None
     cooldown_timer: float = 0.0
     buff_timer: float = 0.0
     level: int = 1
@@ -150,6 +299,7 @@ class Unit:
 class Zombie:
     x: float
     y: float
+    zombie_id: int
     kind: str = "shambler"
     hp: float = 60
     speed: float = 45
@@ -226,6 +376,7 @@ class Building:
     hp: float
     nation_id: int
     max_hp: float
+    building_id: int
     cooldown_timer: float = 0.0
 
 
@@ -234,7 +385,6 @@ class GameSession:
     nations: list[NationState]
     zombies: list[Zombie]
     nodes: list[ResourceNode]
-    selected_unit: Unit | None = None
     selected_nation: int = 0
     minute: float = 0.0
     spawn_timer: float = 0.0
@@ -247,6 +397,10 @@ class GameSession:
     objective_kills: int = 220
     paused: bool = False
     last_spawn_sound: float = 0.0
+    next_unit_id: int = 1
+    next_building_id: int = 1
+    next_zombie_id: int = 1
+    network_timer: float = 0.0
 
     def living_nations(self) -> list[NationState]:
         return [nation for nation in self.nations if nation.base_hp > 0]
@@ -358,31 +512,155 @@ class GameApp:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("consolas", 18)
         self.large_font = pygame.font.SysFont("consolas", 24, bold=True)
+        self.small_font = pygame.font.SysFont("consolas", 15)
+        self.mode = "lobby"
+        self.network = NetworkSession()
+        self.lobby = self._create_lobby()
         self.session = self._create_session()
         self.running = True
         self.audio = AudioManager()
         self.audio.play_music()
         self.background = self._generate_background()
+        self.unit_sprites = self._build_unit_sprites()
+        self.selected_units: list[int] = []
+        self.selected_building: Building | None = None
+        self.drag_start: tuple[int, int] | None = None
+        self.drag_rect: pygame.Rect | None = None
+        self.dragging = False
+        self.local_slot_id = 0
+        self.local_nation_id = 0
 
     def _generate_background(self) -> pygame.Surface:
         surface = pygame.Surface((SCREEN_WIDTH, MAP_HEIGHT))
-        surface.fill(COLOR_BG)
-        for x in range(0, SCREEN_WIDTH, 40):
+        surface.fill(COLOR_WATER)
+        land_color = (40, 70, 55)
+        shore_color = (55, 90, 70)
+        europe_shape = [
+            (220, 120),
+            (290, 80),
+            (370, 70),
+            (450, 80),
+            (520, 120),
+            (560, 170),
+            (620, 190),
+            (690, 210),
+            (760, 200),
+            (820, 230),
+            (880, 240),
+            (940, 270),
+            (960, 320),
+            (920, 360),
+            (860, 380),
+            (820, 400),
+            (780, 420),
+            (730, 450),
+            (650, 470),
+            (560, 470),
+            (490, 450),
+            (450, 420),
+            (420, 380),
+            (380, 340),
+            (340, 310),
+            (310, 280),
+            (280, 240),
+            (250, 200),
+        ]
+        iberia = [(260, 320), (290, 300), (330, 310), (360, 340), (340, 380), (300, 390), (270, 360)]
+        italy = [(470, 320), (500, 330), (520, 360), (510, 390), (480, 380), (460, 350)]
+        scandinavia = [(470, 60), (520, 40), (560, 60), (590, 110), (560, 130), (520, 120), (490, 90)]
+        uk = [(260, 180), (270, 160), (290, 170), (300, 190), (290, 210), (270, 210)]
+        greece = [(610, 360), (630, 350), (650, 360), (660, 380), (640, 400), (620, 390)]
+        pygame.draw.polygon(surface, land_color, europe_shape)
+        pygame.draw.polygon(surface, land_color, iberia)
+        pygame.draw.polygon(surface, land_color, italy)
+        pygame.draw.polygon(surface, land_color, scandinavia)
+        pygame.draw.polygon(surface, land_color, uk)
+        pygame.draw.polygon(surface, land_color, greece)
+        pygame.draw.lines(surface, shore_color, True, europe_shape, 3)
+        for landmass in (iberia, italy, scandinavia, uk, greece):
+            pygame.draw.lines(surface, shore_color, True, landmass, 2)
+        for x in range(0, SCREEN_WIDTH, 80):
             pygame.draw.line(surface, COLOR_GRID, (x, 0), (x, MAP_HEIGHT))
-        for y in range(0, MAP_HEIGHT, 40):
+        for y in range(0, MAP_HEIGHT, 80):
             pygame.draw.line(surface, COLOR_GRID, (0, y), (SCREEN_WIDTH, y))
-        pygame.draw.circle(surface, COLOR_WATER, (SCREEN_WIDTH // 2, MAP_HEIGHT // 2), 180, 4)
+        self._draw_map_labels(surface)
         return surface
+
+    def _draw_map_labels(self, surface: pygame.Surface) -> None:
+        labels = [
+            ("United Kingdom", (250, 150)),
+            ("France", (350, 260)),
+            ("Spain", (300, 340)),
+            ("Germany", (450, 220)),
+            ("Italy", (470, 330)),
+            ("Poland", (560, 230)),
+            ("Sweden", (500, 90)),
+            ("Greece", (620, 360)),
+        ]
+        for name, pos in labels:
+            text = self.small_font.render(name, True, (200, 220, 200))
+            surface.blit(text, pos)
+
+    def _create_lobby(self) -> LobbyState:
+        slots: list[LobbySlot] = []
+        for slot_id in range(MAX_PLAYERS):
+            if slot_id == 0:
+                slots.append(
+                    LobbySlot(
+                        slot_id=slot_id,
+                        nation_id=0,
+                        status="local",
+                        ready=False,
+                        player_name="Host",
+                    )
+                )
+            else:
+                slots.append(LobbySlot(slot_id=slot_id, nation_id=slot_id % len(NATIONS)))
+        return LobbyState(slots=slots)
+
+    def _build_unit_sprites(self) -> dict[tuple[int, str], pygame.Surface]:
+        sprites: dict[tuple[int, str], pygame.Surface] = {}
+        for nation_id, base_color in enumerate(NATION_COLORS):
+            for unit_type in ("worker", "soldier", "hero"):
+                size = 20 if unit_type == "hero" else 14
+                surface = pygame.Surface((size, size), pygame.SRCALPHA)
+                highlight = tuple(min(255, c + 40) for c in base_color)
+                shadow = tuple(max(0, c - 40) for c in base_color)
+                if unit_type == "worker":
+                    pygame.draw.circle(surface, base_color, (size // 2, size // 2), size // 2)
+                    pygame.draw.line(
+                        surface,
+                        highlight,
+                        (size // 2, size // 2),
+                        (size - 2, 2),
+                        2,
+                    )
+                elif unit_type == "soldier":
+                    pygame.draw.rect(surface, base_color, pygame.Rect(2, 2, size - 4, size - 4), border_radius=3)
+                    pygame.draw.line(surface, shadow, (2, size - 3), (size - 3, 2), 2)
+                else:
+                    pygame.draw.circle(surface, highlight, (size // 2, size // 2), size // 2)
+                    pygame.draw.circle(surface, base_color, (size // 2, size // 2), size // 2 - 3)
+                    pygame.draw.circle(surface, shadow, (size // 2, size // 2), 3)
+                sprites[(nation_id, unit_type)] = surface
+        return sprites
 
     def _create_session(self) -> GameSession:
         nations: list[NationState] = []
         nodes: list[ResourceNode] = []
-        center = (SCREEN_WIDTH / 2, MAP_HEIGHT / 2)
-        radius = min(SCREEN_WIDTH, MAP_HEIGHT) * 0.35
+        base_positions = {
+            "United Kingdom": (270, 190),
+            "France": (360, 260),
+            "Spain": (320, 350),
+            "Germany": (460, 220),
+            "Italy": (480, 330),
+            "Poland": (560, 230),
+            "Sweden": (520, 110),
+            "Greece": (620, 370),
+        }
+        session = GameSession(nations=[], zombies=[], nodes=[])
         for idx, blueprint in enumerate(NATIONS):
-            angle = (idx / len(NATIONS)) * math.tau
-            base_x = center[0] + math.cos(angle) * radius
-            base_y = center[1] + math.sin(angle) * radius
+            base_x, base_y = base_positions.get(blueprint.name, (400 + idx * 40, 240 + idx * 20))
             nation = NationState(
                 blueprint_name=blueprint.name,
                 nation_id=idx,
@@ -397,8 +675,10 @@ class GameApp:
                     hp=250,
                     max_hp=250,
                     nation_id=idx,
+                    building_id=session.next_building_id,
                 )
             )
+            session.next_building_id += 1
             for i in range(nation.soldiers):
                 offset = 14 * i
                 nation.units.append(
@@ -407,6 +687,7 @@ class GameApp:
                         y=base_y + 25,
                         unit_type="soldier",
                         nation_id=idx,
+                        unit_id=session.next_unit_id,
                         hp=90,
                         speed=72,
                         attack=18,
@@ -414,6 +695,7 @@ class GameApp:
                         cooldown=1.1,
                     )
                 )
+                session.next_unit_id += 1
             for i in range(nation.workers):
                 offset = -12 * i
                 nation.units.append(
@@ -422,6 +704,7 @@ class GameApp:
                         y=base_y - 25,
                         unit_type="worker",
                         nation_id=idx,
+                        unit_id=session.next_unit_id,
                         hp=55,
                         speed=55,
                         attack=4,
@@ -429,6 +712,7 @@ class GameApp:
                         cooldown=1.4,
                     )
                 )
+                session.next_unit_id += 1
             if idx == 0:
                 nation.units.append(
                     Unit(
@@ -436,6 +720,7 @@ class GameApp:
                         y=base_y,
                         unit_type="hero",
                         nation_id=idx,
+                        unit_id=session.next_unit_id,
                         hp=220,
                         speed=82,
                         attack=26,
@@ -443,25 +728,35 @@ class GameApp:
                         cooldown=0.9,
                     )
                 )
+                session.next_unit_id += 1
             nations.append(nation)
         node_id = 0
-        for ring in (0.2, 0.45, 0.6):
-            ring_radius = min(SCREEN_WIDTH, MAP_HEIGHT) * ring
-            for i in range(10):
-                angle = (i / 10) * math.tau + ring
-                x = center[0] + math.cos(angle) * ring_radius
-                y = center[1] + math.sin(angle) * ring_radius
-                kind = "gold" if i % 2 == 0 else "lumber"
-                nodes.append(ResourceNode(node_id=node_id, x=x, y=y, kind=kind))
+        for base in base_positions.values():
+            for offset, kind in ((-40, "gold"), (40, "lumber")):
+                nodes.append(
+                    ResourceNode(
+                        node_id=node_id,
+                        x=base[0] + offset,
+                        y=base[1] + 55,
+                        kind=kind,
+                    )
+                )
                 node_id += 1
-        return GameSession(nations=nations, zombies=[], nodes=nodes)
+        session.nations = nations
+        session.nodes = nodes
+        return session
 
     def run(self) -> None:
         while self.running:
             dt = self.clock.tick(FPS) / 1000.0
+            self.network.poll()
+            self._handle_network_messages()
             self._handle_events()
-            if not self.session.paused:
-                self._update(dt)
+            if self.mode == "game":
+                if not self.session.paused and not self._is_network_client():
+                    self._update(dt)
+                if self._is_network_host():
+                    self._broadcast_state(dt)
             self._render()
         pygame.quit()
 
@@ -469,63 +764,624 @@ class GameApp:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
-            if event.type == pygame.KEYDOWN:
+            if self.mode == "lobby":
+                self._handle_lobby_event(event)
+            else:
+                self._handle_game_event(event)
+
+    def _handle_lobby_event(self, event: pygame.event.Event) -> None:
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_h:
+                self._start_hosting()
+                return
+            if event.key == pygame.K_j:
+                self._start_joining()
+                return
+            if event.key == pygame.K_RETURN:
+                if self._is_network_client() and self.network.socket:
+                    self.network.send(
+                        {
+                            "type": "ready",
+                            "ready": self._toggle_local_ready(),
+                        }
+                    )
+            if event.key == pygame.K_BACKSPACE:
+                if self.lobby.ip_input:
+                    self.lobby.ip_input = self.lobby.ip_input[:-1]
+            if event.unicode and event.key not in (pygame.K_RETURN, pygame.K_BACKSPACE):
+                if event.unicode.isprintable():
+                    if event.unicode in "0123456789.:" and len(self.lobby.ip_input) < 24:
+                        self.lobby.ip_input += event.unicode
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self._handle_lobby_click(event.pos)
+
+    def _handle_game_event(self, event: pygame.event.Event) -> None:
+        if event.type == pygame.KEYDOWN:
+            if not self._is_network_client():
                 if pygame.K_1 <= event.key <= pygame.K_8:
                     self.session.selected_nation = event.key - pygame.K_1
                     self.session.build_mode = None
-                if event.key == pygame.K_s:
-                    self._train_soldier()
-                if event.key == pygame.K_w:
-                    self._train_worker()
-                if event.key == pygame.K_r:
-                    self._research_tier()
-                if event.key == pygame.K_b:
-                    self.session.build_mode = "barracks"
-                if event.key == pygame.K_d:
-                    self.session.build_mode = "tower"
-                if event.key == pygame.K_q:
-                    self._trigger_battle_cry()
-                if event.key == pygame.K_m:
-                    self.audio.toggle_music()
-                if event.key == pygame.K_p:
-                    self.session.paused = not self.session.paused
-                if event.key == pygame.K_ESCAPE:
-                    if self.session.game_over:
-                        self.running = False
-                    self.session.build_mode = None
-            if event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1:
+            if event.key == pygame.K_s:
+                self._queue_command({"action": "train_soldier"})
+            if event.key == pygame.K_w:
+                self._queue_command({"action": "train_worker"})
+            if event.key == pygame.K_r:
+                self._queue_command({"action": "research"})
+            if event.key == pygame.K_b:
+                self.session.build_mode = "barracks"
+            if event.key == pygame.K_d:
+                self.session.build_mode = "tower"
+            if event.key == pygame.K_q:
+                self._queue_command({"action": "battle_cry"})
+            if event.key == pygame.K_m:
+                self.audio.toggle_music()
+            if event.key == pygame.K_p:
+                self.session.paused = not self.session.paused
+            if event.key == pygame.K_ESCAPE:
+                if self.session.game_over:
+                    self.running = False
+                self.session.build_mode = None
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 1:
+                if event.pos[1] < MAP_HEIGHT:
                     if self.session.build_mode:
-                        self._place_building(event.pos)
+                        self._queue_command({"action": "place_building", "pos": event.pos})
                     else:
-                        self._select_unit(event.pos)
-                if event.button == 3:
-                    self._move_selected(event.pos)
+                        self.drag_start = event.pos
+                        self.dragging = True
+                        self.drag_rect = None
+            if event.button == 3:
+                if event.pos[1] < MAP_HEIGHT:
+                    self._queue_command({"action": "order", "pos": event.pos})
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            if self.dragging and self.drag_start:
+                end_pos = event.pos
+                self.dragging = False
+                if self.drag_rect and self.drag_rect.width > 6 and self.drag_rect.height > 6:
+                    self._select_units_in_rect(self.drag_rect)
+                else:
+                    self._select_units_at_pos(end_pos)
+                self.drag_rect = None
+                self.drag_start = None
+        if event.type == pygame.MOUSEMOTION and self.dragging and self.drag_start:
+            current = event.pos
+            x1, y1 = self.drag_start
+            x2, y2 = current
+            rect = pygame.Rect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+            self.drag_rect = rect
 
-    def _select_unit(self, pos: tuple[int, int]) -> None:
+    def _is_network_host(self) -> bool:
+        return self.network.role == "host"
+
+    def _is_network_client(self) -> bool:
+        return self.network.role == "client"
+
+    def _start_hosting(self) -> None:
+        if self.network.role:
+            return
+        self.network.host(NETWORK_PORT)
+        self.lobby.info_message = f"Hosting on port {NETWORK_PORT}. Waiting for players..."
+
+    def _start_joining(self) -> None:
+        if self.network.role:
+            return
+        host = self.lobby.ip_input.strip() or "127.0.0.1"
+        self.network.join(host, NETWORK_PORT)
+        self.network.send({"type": "join", "name": self.lobby.name_input or "Player"})
+        self.lobby.info_message = f"Connecting to {host}:{NETWORK_PORT}..."
+
+    def _handle_lobby_click(self, pos: tuple[int, int]) -> None:
+        slot_height = 80
+        start_y = 120
+        for slot in self.lobby.slots:
+            rect = pygame.Rect(120, start_y + slot.slot_id * slot_height, 860, 70)
+            if rect.collidepoint(pos):
+                self.lobby.active_slot = slot.slot_id
+                left_arrow = pygame.Rect(rect.right - 210, rect.y + 20, 24, 30)
+                right_arrow = pygame.Rect(rect.right - 120, rect.y + 20, 24, 30)
+                ready_rect = pygame.Rect(rect.right - 80, rect.y + 18, 70, 34)
+                status_rect = pygame.Rect(rect.x + 10, rect.y + 18, 90, 34)
+                if status_rect.collidepoint(pos) and self._is_network_host():
+                    self._cycle_slot_status(slot)
+                    return
+                if left_arrow.collidepoint(pos) and self._can_edit_slot(slot):
+                    self._change_slot_nation(slot, -1)
+                    return
+                if right_arrow.collidepoint(pos) and self._can_edit_slot(slot):
+                    self._change_slot_nation(slot, 1)
+                    return
+                if ready_rect.collidepoint(pos) and slot.status in {"local", "remote"}:
+                    if slot.status == "local":
+                        self._toggle_local_ready()
+                return
+        start_rect = pygame.Rect(520, 520, 220, 48)
+        if start_rect.collidepoint(pos):
+            if self._is_network_host() and self._all_ready():
+                self._start_game()
+            elif not self.network.role:
+                self._start_game()
+
+    def _cycle_slot_status(self, slot: LobbySlot) -> None:
+        if slot.status == "local":
+            return
+        order = ["open", "ai", "closed"]
+        next_status = order[(order.index(slot.status) + 1) % len(order)]
+        slot.status = next_status
+        slot.player_name = "AI" if slot.status == "ai" else "Open" if slot.status == "open" else "Closed"
+        slot.ready = slot.status == "ai"
+        self._broadcast_lobby_state()
+
+    def _toggle_local_ready(self) -> bool:
+        slot = self._local_lobby_slot()
+        if not slot:
+            return False
+        slot.ready = not slot.ready
+        self._broadcast_lobby_state()
+        return slot.ready
+
+    def _local_lobby_slot(self) -> LobbySlot | None:
+        if 0 <= self.local_slot_id < len(self.lobby.slots):
+            return self.lobby.slots[self.local_slot_id]
+        return None
+
+    def _can_edit_slot(self, slot: LobbySlot) -> bool:
+        if self._is_network_host():
+            return slot.status in {"local", "ai", "open", "remote"}
+        if self._is_network_client():
+            return slot.status == "local"
+        return True
+
+    def _change_slot_nation(self, slot: LobbySlot, direction: int) -> None:
+        slot.nation_id = (slot.nation_id + direction) % len(NATIONS)
+        if self._is_network_client():
+            self.network.send({"type": "nation", "nation_id": slot.nation_id})
+        else:
+            self._broadcast_lobby_state()
+
+    def _all_ready(self) -> bool:
+        for slot in self.lobby.slots:
+            if slot.status in {"local", "remote"} and not slot.ready:
+                return False
+        return any(slot.status in {"local", "remote", "ai"} for slot in self.lobby.slots)
+
+    def _queue_command(self, payload: dict) -> None:
+        if self.mode != "game":
+            return
+        if self._is_network_client():
+            payload.update({"type": "command"})
+            if payload.get("action") == "order":
+                payload["unit_ids"] = list(self.selected_units)
+            if payload.get("action") == "place_building":
+                payload["building_type"] = self.session.build_mode
+            self.network.send(payload)
+        else:
+            self._apply_command(payload, self.session.selected_nation)
+
+    def _apply_command(self, payload: dict, nation_id: int) -> None:
+        action = payload.get("action")
+        if action == "train_soldier":
+            self._train_soldier(nation_id)
+        elif action == "train_worker":
+            self._train_worker(nation_id)
+        elif action == "research":
+            self._research_tier(nation_id)
+        elif action == "battle_cry":
+            self._trigger_battle_cry(nation_id)
+        elif action == "place_building":
+            pos = payload.get("pos")
+            building_type = payload.get("building_type")
+            if pos and building_type:
+                self._place_building(pos, nation_id, building_type)
+        elif action == "order":
+            unit_ids = payload.get("unit_ids", list(self.selected_units))
+            pos = payload.get("pos")
+            if pos:
+                self._issue_order(nation_id, unit_ids, pos)
+
+    def _handle_network_messages(self) -> None:
+        for message in list(self.network.inbox):
+            self.network.inbox.remove(message)
+            if self._is_network_host():
+                self._handle_host_message(message)
+            elif self._is_network_client():
+                self._handle_client_message(message)
+
+    def _handle_host_message(self, message: dict) -> None:
+        msg_type = message.get("type")
+        if msg_type == "client_joined":
+            self._assign_client_to_slot(message["client_id"])
+            return
+        if msg_type == "client_left":
+            self._remove_client_from_slot(message["client_id"])
+            return
+        if msg_type == "join":
+            slot = self._slot_for_socket(message.get("_socket"))
+            if slot:
+                slot.player_name = message.get("name", "Player")
+                slot.ready = False
+                self._broadcast_lobby_state()
+            return
+        if msg_type == "ready":
+            slot = self._slot_for_socket(message.get("_socket"))
+            if slot:
+                slot.ready = bool(message.get("ready"))
+                self._broadcast_lobby_state()
+            return
+        if msg_type == "nation":
+            slot = self._slot_for_socket(message.get("_socket"))
+            if slot:
+                slot.nation_id = int(message.get("nation_id", slot.nation_id))
+                self._broadcast_lobby_state()
+            return
+        if msg_type == "command":
+            slot = self._slot_for_socket(message.get("_socket"))
+            if slot and self.mode == "game":
+                self._apply_command(message, slot.nation_id)
+
+    def _handle_client_message(self, message: dict) -> None:
+        msg_type = message.get("type")
+        if msg_type == "assign":
+            self.local_slot_id = int(message.get("slot_id", 0))
+        if msg_type == "lobby_state":
+            self._apply_lobby_state(message.get("slots", []))
+        if msg_type == "start_game":
+            self._start_game_from_network(message)
+        if msg_type == "state":
+            self._apply_network_state(message.get("state", {}))
+
+    def _assign_client_to_slot(self, client_id: int) -> None:
+        for slot in self.lobby.slots:
+            if slot.status == "open":
+                slot.status = "remote"
+                slot.connection_id = client_id
+                slot.player_name = f"Player {client_id}"
+                slot.ready = False
+                self.network.send(
+                    {"type": "assign", "slot_id": slot.slot_id},
+                    self.network.clients.get(client_id),
+                )
+                self._broadcast_lobby_state()
+                return
+        self.network.send({"type": "message", "text": "Lobby full."}, self.network.clients.get(client_id))
+
+    def _remove_client_from_slot(self, client_id: int) -> None:
+        for slot in self.lobby.slots:
+            if slot.connection_id == client_id:
+                slot.status = "open"
+                slot.connection_id = None
+                slot.player_name = "Open"
+                slot.ready = False
+                self._broadcast_lobby_state()
+                return
+
+    def _slot_for_socket(self, sock: socket.socket | None) -> LobbySlot | None:
+        if sock is None:
+            return None
+        client_id = next((cid for cid, csock in self.network.clients.items() if csock is sock), None)
+        if client_id is None:
+            return None
+        return next((slot for slot in self.lobby.slots if slot.connection_id == client_id), None)
+
+    def _broadcast_lobby_state(self) -> None:
+        if not self._is_network_host():
+            return
+        payload = {
+            "type": "lobby_state",
+            "slots": [
+                {
+                    "slot_id": slot.slot_id,
+                    "nation_id": slot.nation_id,
+                    "status": slot.status,
+                    "ready": slot.ready,
+                    "player_name": slot.player_name,
+                }
+                for slot in self.lobby.slots
+            ],
+        }
+        self.network.send(payload)
+
+    def _apply_lobby_state(self, slots: list[dict]) -> None:
+        for slot_info in slots:
+            slot = self.lobby.slots[slot_info["slot_id"]]
+            slot.nation_id = slot_info["nation_id"]
+            slot.status = slot_info["status"]
+            slot.ready = slot_info["ready"]
+            slot.player_name = slot_info["player_name"]
+        if self._is_network_client():
+            for slot in self.lobby.slots:
+                if slot.slot_id == self.local_slot_id:
+                    slot.status = "local"
+
+    def _start_game(self) -> None:
+        self.session = self._create_session_from_lobby()
+        self.session.selected_nation = self.local_nation_id
+        self.mode = "game"
+        self.selected_units = []
+        self.selected_building = None
+        if self._is_network_host():
+            self._broadcast_lobby_state()
+            self.network.send(
+                {
+                    "type": "start_game",
+                    "slots": [
+                        {
+                            "slot_id": slot.slot_id,
+                            "nation_id": slot.nation_id,
+                            "status": slot.status,
+                        }
+                        for slot in self.lobby.slots
+                    ],
+                    "state": self._serialize_session(self.session),
+                }
+            )
+
+    def _start_game_from_network(self, message: dict) -> None:
+        self.mode = "game"
+        self.selected_units = []
+        self.selected_building = None
+        if message.get("slots"):
+            self._apply_lobby_state(message.get("slots", []))
+        self._apply_network_state(message.get("state", {}))
+        if 0 <= self.local_slot_id < len(self.lobby.slots):
+            self.local_nation_id = self.lobby.slots[self.local_slot_id].nation_id
+            self.session.selected_nation = self.local_nation_id
+
+    def _broadcast_state(self, dt: float) -> None:
+        if not self._is_network_host() or self.mode != "game":
+            return
+        self.session.network_timer += dt
+        if self.session.network_timer < 0.2:
+            return
+        self.session.network_timer = 0.0
+        self.network.send({"type": "state", "state": self._serialize_session(self.session)})
+
+    def _create_session_from_lobby(self) -> GameSession:
+        session = self._create_session()
+        active_nations = {
+            slot.nation_id
+            for slot in self.lobby.slots
+            if slot.status in {"local", "remote", "ai"}
+        }
+        for slot in self.lobby.slots:
+            if slot.status == "local":
+                self.local_nation_id = slot.nation_id
+            if slot.status in {"local", "remote"}:
+                session.nations[slot.nation_id].ai_controlled = False
+        for nation_id, nation in enumerate(session.nations):
+            if nation_id not in active_nations:
+                nation.base_hp = 0
+                nation.units.clear()
+                nation.buildings.clear()
+        return session
+
+    def _serialize_session(self, session: GameSession) -> dict:
+        return {
+            "minute": session.minute,
+            "zombies_slain": session.zombies_slain,
+            "objective_minutes": session.objective_minutes,
+            "objective_kills": session.objective_kills,
+            "game_over": session.game_over,
+            "victory": session.victory,
+            "nations": [
+                {
+                    "nation_id": nation.nation_id,
+                    "blueprint_name": nation.blueprint_name,
+                    "base_pos": nation.base_pos,
+                    "base_hp": nation.base_hp,
+                    "base_max_hp": nation.base_max_hp,
+                    "resources": {
+                        "gold": nation.resources.gold,
+                        "lumber": nation.resources.lumber,
+                        "food": nation.resources.food,
+                        "arcana": nation.resources.arcana,
+                    },
+                    "workers": nation.workers,
+                    "soldiers": nation.soldiers,
+                    "tech_tier": nation.tech_tier,
+                    "ai_controlled": nation.ai_controlled,
+                    "hero_cooldown": nation.hero_cooldown,
+                    "units": [
+                        {
+                            "unit_id": unit.unit_id,
+                            "x": unit.x,
+                            "y": unit.y,
+                            "unit_type": unit.unit_type,
+                            "hp": unit.hp,
+                            "speed": unit.speed,
+                            "attack": unit.attack,
+                            "range": unit.range,
+                            "cooldown": unit.cooldown,
+                            "cooldown_timer": unit.cooldown_timer,
+                            "buff_timer": unit.buff_timer,
+                            "level": unit.level,
+                            "xp": unit.xp,
+                        }
+                        for unit in nation.units
+                    ],
+                    "buildings": [
+                        {
+                            "building_id": building.building_id,
+                            "x": building.x,
+                            "y": building.y,
+                            "building_type": building.building_type,
+                            "hp": building.hp,
+                            "max_hp": building.max_hp,
+                            "cooldown_timer": building.cooldown_timer,
+                        }
+                        for building in nation.buildings
+                    ],
+                }
+                for nation in session.nations
+            ],
+            "nodes": [
+                {
+                    "node_id": node.node_id,
+                    "x": node.x,
+                    "y": node.y,
+                    "kind": node.kind,
+                    "amount": node.amount,
+                }
+                for node in session.nodes
+            ],
+            "zombies": [
+                {
+                    "zombie_id": zombie.zombie_id,
+                    "x": zombie.x,
+                    "y": zombie.y,
+                    "kind": zombie.kind,
+                    "hp": zombie.hp,
+                    "speed": zombie.speed,
+                    "attack": zombie.attack,
+                    "range": zombie.range,
+                    "cooldown": zombie.cooldown,
+                    "cooldown_timer": zombie.cooldown_timer,
+                }
+                for zombie in session.zombies
+            ],
+        }
+
+    def _apply_network_state(self, state: dict) -> None:
+        session = self.session
+        session.minute = state.get("minute", session.minute)
+        session.zombies_slain = state.get("zombies_slain", session.zombies_slain)
+        session.objective_minutes = state.get("objective_minutes", session.objective_minutes)
+        session.objective_kills = state.get("objective_kills", session.objective_kills)
+        session.game_over = state.get("game_over", session.game_over)
+        session.victory = state.get("victory", session.victory)
+        session.nodes = [
+            ResourceNode(
+                node_id=node["node_id"],
+                x=node["x"],
+                y=node["y"],
+                kind=node["kind"],
+                amount=node["amount"],
+            )
+            for node in state.get("nodes", [])
+        ]
+        session.zombies = [
+            Zombie(
+                x=zombie["x"],
+                y=zombie["y"],
+                zombie_id=zombie["zombie_id"],
+                kind=zombie["kind"],
+                hp=zombie["hp"],
+                speed=zombie["speed"],
+                attack=zombie["attack"],
+                range=zombie["range"],
+                cooldown=zombie["cooldown"],
+                cooldown_timer=zombie["cooldown_timer"],
+            )
+            for zombie in state.get("zombies", [])
+        ]
+        session.nations = []
+        for nation_info in state.get("nations", []):
+            nation = NationState(
+                blueprint_name=nation_info["blueprint_name"],
+                nation_id=nation_info["nation_id"],
+                base_pos=tuple(nation_info["base_pos"]),
+                ai_controlled=nation_info.get("ai_controlled", True),
+                base_hp=nation_info["base_hp"],
+                base_max_hp=nation_info["base_max_hp"],
+                workers=nation_info["workers"],
+                soldiers=nation_info["soldiers"],
+                tech_tier=nation_info["tech_tier"],
+                hero_cooldown=nation_info.get("hero_cooldown", 0.0),
+            )
+            nation.resources = Resources(
+                gold=nation_info["resources"]["gold"],
+                lumber=nation_info["resources"]["lumber"],
+                food=nation_info["resources"]["food"],
+                arcana=nation_info["resources"]["arcana"],
+            )
+            nation.units = [
+                Unit(
+                    x=unit["x"],
+                    y=unit["y"],
+                    unit_type=unit["unit_type"],
+                    nation_id=nation.nation_id,
+                    unit_id=unit["unit_id"],
+                    hp=unit["hp"],
+                    speed=unit["speed"],
+                    attack=unit["attack"],
+                    range=unit["range"],
+                    cooldown=unit["cooldown"],
+                    cooldown_timer=unit["cooldown_timer"],
+                    buff_timer=unit["buff_timer"],
+                    level=unit["level"],
+                    xp=unit["xp"],
+                )
+                for unit in nation_info["units"]
+            ]
+            nation.buildings = [
+                Building(
+                    x=building["x"],
+                    y=building["y"],
+                    building_type=building["building_type"],
+                    hp=building["hp"],
+                    nation_id=nation.nation_id,
+                    max_hp=building["max_hp"],
+                    building_id=building["building_id"],
+                    cooldown_timer=building["cooldown_timer"],
+                )
+                for building in nation_info["buildings"]
+            ]
+            session.nations.append(nation)
+        valid_ids = {unit.unit_id for nation in session.nations for unit in nation.units}
+        self.selected_units = [unit_id for unit_id in self.selected_units if unit_id in valid_ids]
+
+    def _select_units_at_pos(self, pos: tuple[int, int]) -> None:
         x, y = pos
-        selected = None
+        self.selected_building = None
+        self.selected_units = []
         for unit in self._units_for_nation(self.session.selected_nation):
             if math.hypot(unit.x - x, unit.y - y) < 18:
-                selected = unit
-                break
-        self.session.selected_unit = selected
+                self.selected_units = [unit.unit_id]
+                return
+        for building in self.session.nations[self.session.selected_nation].buildings:
+            if math.hypot(building.x - x, building.y - y) < 20:
+                self.selected_building = building
+                return
 
-    def _move_selected(self, pos: tuple[int, int]) -> None:
-        if self.session.selected_unit:
-            node = self._node_at_position(pos)
-            if node and self.session.selected_unit.unit_type == "worker":
-                self.session.selected_unit.harvest_node_id = node.node_id
-                self.session.selected_unit.target = (node.x, node.y)
+    def _select_units_in_rect(self, rect: pygame.Rect) -> None:
+        self.selected_building = None
+        self.selected_units = []
+        for unit in self._units_for_nation(self.session.selected_nation):
+            if rect.collidepoint(unit.x, unit.y):
+                self.selected_units.append(unit.unit_id)
+
+    def _issue_order(self, nation_id: int, unit_ids: list[int], pos: tuple[int, int]) -> None:
+        if not unit_ids:
+            return
+        x, y = pos
+        zombie = self._zombie_at_position(pos)
+        node = self._node_at_position(pos)
+        for unit in self._units_for_nation(nation_id):
+            if unit.unit_id not in unit_ids:
+                continue
+            if zombie:
+                unit.order_type = "attack"
+                unit.order_target_id = zombie.zombie_id
+                unit.order_pos = (zombie.x, zombie.y)
+                unit.target = (zombie.x, zombie.y)
+                unit.harvest_node_id = None
+            elif node and unit.unit_type == "worker":
+                unit.order_type = "harvest"
+                unit.order_target_id = node.node_id
+                unit.order_pos = (node.x, node.y)
+                unit.harvest_node_id = node.node_id
+                unit.target = (node.x, node.y)
             else:
-                self.session.selected_unit.harvest_node_id = None
-                self.session.selected_unit.target = (float(pos[0]), float(pos[1]))
+                unit.order_type = "move"
+                unit.order_target_id = None
+                unit.order_pos = (float(x), float(y))
+                unit.harvest_node_id = None
+                unit.target = (float(x), float(y))
 
-    def _place_building(self, pos: tuple[int, int]) -> None:
-        nation = self.session.nations[self.session.selected_nation]
+    def _place_building(self, pos: tuple[int, int], nation_id: int, building_type: str | None) -> None:
+        nation = self.session.nations[nation_id]
         if nation.base_hp <= 0:
             return
-        if self.session.build_mode == "barracks":
+        if building_type == "barracks":
             cost = (140, 80)
             building_type = "barracks"
             hp = 200
@@ -550,14 +1406,16 @@ class GameApp:
                 hp=hp,
                 max_hp=hp,
                 nation_id=nation.nation_id,
+                building_id=self.session.next_building_id,
             )
         )
+        self.session.next_building_id += 1
         self._push_message(f"{building_type.title()} constructed.")
         self.audio.play("place")
         self.session.build_mode = None
 
-    def _train_soldier(self) -> None:
-        nation = self.session.nations[self.session.selected_nation]
+    def _train_soldier(self, nation_id: int) -> None:
+        nation = self.session.nations[nation_id]
         if nation.supply_used() >= nation.supply_cap():
             self._push_message("Supply cap reached. Build more towers/barracks.")
             self.audio.play("warning")
@@ -579,6 +1437,7 @@ class GameApp:
                 y=base_y + random.uniform(-25, 25),
                 unit_type="soldier",
                 nation_id=nation.nation_id,
+                unit_id=self.session.next_unit_id,
                 hp=90,
                 speed=72,
                 attack=18,
@@ -586,10 +1445,11 @@ class GameApp:
                 cooldown=1.1,
             )
         )
+        self.session.next_unit_id += 1
         self.audio.play("train")
 
-    def _train_worker(self) -> None:
-        nation = self.session.nations[self.session.selected_nation]
+    def _train_worker(self, nation_id: int) -> None:
+        nation = self.session.nations[nation_id]
         if nation.supply_used() >= nation.supply_cap():
             self._push_message("Supply cap reached. Build more towers/barracks.")
             self.audio.play("warning")
@@ -607,6 +1467,7 @@ class GameApp:
                 y=base_y + random.uniform(-20, 20),
                 unit_type="worker",
                 nation_id=nation.nation_id,
+                unit_id=self.session.next_unit_id,
                 hp=55,
                 speed=55,
                 attack=4,
@@ -614,10 +1475,11 @@ class GameApp:
                 cooldown=1.4,
             )
         )
+        self.session.next_unit_id += 1
         self.audio.play("train")
 
-    def _research_tier(self) -> None:
-        nation = self.session.nations[self.session.selected_nation]
+    def _research_tier(self, nation_id: int) -> None:
+        nation = self.session.nations[nation_id]
         if nation.tech_tier >= 4:
             self._push_message("Tech tree fully researched.")
             self.audio.play("warning")
@@ -637,8 +1499,8 @@ class GameApp:
         self._push_message(f"Tech Tier {nation.tech_tier} reached.")
         self.audio.play("train")
 
-    def _trigger_battle_cry(self) -> None:
-        nation = self.session.nations[self.session.selected_nation]
+    def _trigger_battle_cry(self, nation_id: int) -> None:
+        nation = self.session.nations[nation_id]
         hero = next((unit for unit in nation.units if unit.unit_type == "hero"), None)
         if not hero:
             self._push_message("No hero available.")
@@ -675,6 +1537,14 @@ class GameApp:
             if nation.hero_cooldown > 0:
                 nation.hero_cooldown = max(0.0, nation.hero_cooldown - dt)
             for unit in list(nation.units):
+                if unit.order_type == "attack":
+                    target = next((z for z in session.zombies if z.zombie_id == unit.order_target_id), None)
+                    if target:
+                        unit.target = (target.x, target.y)
+                    else:
+                        unit.order_type = None
+                        unit.order_target_id = None
+                        unit.order_pos = None
                 unit.update(dt)
             self._harvest_with_workers(nation, dt)
             self._update_buildings(nation, dt)
@@ -695,6 +1565,7 @@ class GameApp:
                     y=base_y + random.uniform(-25, 25),
                     unit_type="soldier",
                     nation_id=nation.nation_id,
+                    unit_id=self.session.next_unit_id,
                     hp=90,
                     speed=72,
                     attack=18,
@@ -702,6 +1573,7 @@ class GameApp:
                     cooldown=1.1,
                 )
             )
+            self.session.next_unit_id += 1
         if nation.can_afford(50, 15) and nation.workers < 12:
             nation.spend(50, 15)
             nation.workers += 1
@@ -712,6 +1584,7 @@ class GameApp:
                     y=base_y + random.uniform(-20, 20),
                     unit_type="worker",
                     nation_id=nation.nation_id,
+                    unit_id=self.session.next_unit_id,
                     hp=55,
                     speed=55,
                     attack=4,
@@ -719,6 +1592,7 @@ class GameApp:
                     cooldown=1.4,
                 )
             )
+            self.session.next_unit_id += 1
         for unit in nation.units:
             if unit.unit_type == "soldier" and unit.target is None:
                 offset = random.uniform(-60, 60)
@@ -740,8 +1614,10 @@ class GameApp:
                     hp=200,
                     max_hp=200,
                     nation_id=nation.nation_id,
+                    building_id=self.session.next_building_id,
                 )
             )
+            self.session.next_building_id += 1
         if nation.can_afford(120, 100) and len(nation.buildings) < 4:
             base_x, base_y = nation.base_pos
             nation.spend(120, 100)
@@ -753,8 +1629,10 @@ class GameApp:
                     hp=180,
                     max_hp=180,
                     nation_id=nation.nation_id,
+                    building_id=self.session.next_building_id,
                 )
             )
+            self.session.next_building_id += 1
         if nation.hero_cooldown <= 0:
             hero = next((unit for unit in nation.units if unit.unit_type == "hero"), None)
             if hero and random.random() < 0.02:
@@ -795,6 +1673,7 @@ class GameApp:
                 Zombie(
                     x=x,
                     y=y,
+                    zombie_id=session.next_zombie_id,
                     kind=kind,
                     hp=spec["hp"],
                     speed=spec["speed"],
@@ -803,6 +1682,7 @@ class GameApp:
                     cooldown=spec["cooldown"],
                 )
             )
+            session.next_zombie_id += 1
         if session.minute - session.last_spawn_sound > 0.6:
             self.audio.play("spawn")
             session.last_spawn_sound = session.minute
@@ -822,7 +1702,13 @@ class GameApp:
             for unit in list(nation.units):
                 if unit.cooldown_timer > 0:
                     continue
-                target = self._closest_zombie(unit.x, unit.y, unit.range)
+                target = None
+                if unit.order_type == "attack" and unit.order_target_id is not None:
+                    target = next((z for z in session.zombies if z.zombie_id == unit.order_target_id), None)
+                    if target and self._distance((unit.x, unit.y), (target.x, target.y)) > unit.range:
+                        target = None
+                if not target:
+                    target = self._closest_zombie(unit.x, unit.y, unit.range)
                 if target:
                     target.hp -= unit.current_attack
                     unit.cooldown_timer = unit.cooldown
@@ -848,6 +1734,8 @@ class GameApp:
             for unit in list(nation.units):
                 if unit.hp <= 0:
                     nation.units.remove(unit)
+                    if unit.unit_id in self.selected_units:
+                        self.selected_units.remove(unit.unit_id)
                     if unit.unit_type == "worker":
                         nation.workers = max(0, nation.workers - 1)
                     elif unit.unit_type == "soldier":
@@ -957,14 +1845,19 @@ class GameApp:
 
     def _render(self) -> None:
         self.screen.fill(COLOR_BG)
-        self.screen.blit(self.background, (0, 0))
-        pygame.draw.rect(self.screen, COLOR_PANEL, (0, MAP_HEIGHT, SCREEN_WIDTH, UI_HEIGHT))
-        self._draw_map()
-        self._draw_ui()
-        if self.session.game_over:
-            self._draw_game_over()
-        if self.session.paused and not self.session.game_over:
-            self._draw_paused()
+        if self.mode == "lobby":
+            self._draw_lobby()
+        else:
+            self.screen.blit(self.background, (0, 0))
+            pygame.draw.rect(self.screen, COLOR_PANEL, (0, MAP_HEIGHT, SCREEN_WIDTH, UI_HEIGHT))
+            self._draw_map()
+            self._draw_ui()
+            if self.drag_rect:
+                pygame.draw.rect(self.screen, COLOR_SELECTION, self.drag_rect, 2)
+            if self.session.game_over:
+                self._draw_game_over()
+            if self.session.paused and not self.session.game_over:
+                self._draw_paused()
         pygame.display.flip()
 
     def _draw_map(self) -> None:
@@ -995,19 +1888,29 @@ class GameApp:
                         13,
                     )
                     self._draw_health_bar((building.x - 13, building.y - 22), 26, building.hp / building.max_hp)
+                if building is self.selected_building:
+                    pygame.draw.circle(
+                        self.screen,
+                        COLOR_SELECTION,
+                        (int(building.x), int(building.y)),
+                        18,
+                        2,
+                    )
             for unit in nation.units:
-                if unit.unit_type == "hero":
-                    radius = 10
-                    pygame.draw.circle(self.screen, COLOR_HIGHLIGHT, (int(unit.x), int(unit.y)), radius + 3)
+                sprite = self.unit_sprites.get((unit.nation_id, unit.unit_type))
+                if sprite:
+                    rect = sprite.get_rect(center=(int(unit.x), int(unit.y)))
+                    self.screen.blit(sprite, rect)
+                    radius = rect.width // 2
                 else:
                     radius = 6 if unit.unit_type == "worker" else 8
-                pygame.draw.circle(self.screen, color, (int(unit.x), int(unit.y)), radius)
-                if unit is self.session.selected_unit:
+                    pygame.draw.circle(self.screen, color, (int(unit.x), int(unit.y)), radius)
+                if unit.unit_id in self.selected_units:
                     pygame.draw.circle(
                         self.screen,
                         COLOR_SELECTION,
                         (int(unit.x), int(unit.y)),
-                        radius + 5,
+                        radius + 6,
                         2,
                     )
                 if unit.buff_timer > 0:
@@ -1029,6 +1932,46 @@ class GameApp:
 
         if self.session.build_mode:
             self._draw_build_preview()
+
+    def _draw_lobby(self) -> None:
+        self.screen.fill(COLOR_BG)
+        title = "Eras Zombie Invasion - Lobby"
+        self._blit_text(title, 420, 30, self.large_font)
+        instructions = "H: Host | J: Join (type IP) | Click slot status/nation | Ready with button"
+        self._blit_text(instructions, 260, 60, self.font)
+        if self.lobby.info_message:
+            self._blit_text(self.lobby.info_message, 320, 90, self.font, color=COLOR_HIGHLIGHT)
+        self._blit_text(f"IP: {self.lobby.ip_input or '127.0.0.1'}", 120, 560, self.font)
+
+        slot_height = 80
+        start_y = 120
+        for slot in self.lobby.slots:
+            rect = pygame.Rect(120, start_y + slot.slot_id * slot_height, 860, 70)
+            pygame.draw.rect(self.screen, COLOR_PANEL, rect, border_radius=6)
+            if slot.slot_id == self.local_slot_id:
+                pygame.draw.rect(self.screen, COLOR_SELECTION, rect, 2, border_radius=6)
+            status_rect = pygame.Rect(rect.x + 10, rect.y + 18, 90, 34)
+            pygame.draw.rect(self.screen, COLOR_ACCENT, status_rect, border_radius=4)
+            self._blit_text(slot.status.title(), status_rect.x + 8, status_rect.y + 8, self.small_font)
+            self._blit_text(slot.player_name, rect.x + 120, rect.y + 10, self.font)
+            nation_name = NATIONS[slot.nation_id].name
+            self._blit_text(nation_name, rect.x + 120, rect.y + 38, self.small_font)
+            left_arrow = pygame.Rect(rect.right - 210, rect.y + 20, 24, 30)
+            right_arrow = pygame.Rect(rect.right - 120, rect.y + 20, 24, 30)
+            pygame.draw.rect(self.screen, COLOR_GRID, left_arrow, border_radius=2)
+            pygame.draw.rect(self.screen, COLOR_GRID, right_arrow, border_radius=2)
+            self._blit_text("<", left_arrow.x + 7, left_arrow.y + 5, self.font)
+            self._blit_text(">", right_arrow.x + 7, right_arrow.y + 5, self.font)
+            ready_rect = pygame.Rect(rect.right - 80, rect.y + 18, 70, 34)
+            ready_color = (90, 170, 110) if slot.ready else COLOR_ALERT
+            pygame.draw.rect(self.screen, ready_color, ready_rect, border_radius=4)
+            self._blit_text("Ready" if slot.ready else "Wait", ready_rect.x + 8, ready_rect.y + 8, self.small_font)
+
+        start_rect = pygame.Rect(520, 520, 220, 48)
+        pygame.draw.rect(self.screen, COLOR_HIGHLIGHT, start_rect, border_radius=6)
+        self._blit_text("Start Game", start_rect.x + 45, start_rect.y + 12, self.font)
+        if not self._all_ready():
+            self._blit_text("Waiting for all players ready...", 440, 580, self.font, color=COLOR_ALERT)
 
     def _draw_build_preview(self) -> None:
         pos = pygame.mouse.get_pos()
@@ -1061,7 +2004,7 @@ class GameApp:
         )
         self._blit_text(objective, 20, MAP_HEIGHT + 96, self.font)
         controls = (
-            "Controls: 1-8 switch | LMB select/place | RMB move/harvest | "
+            "Controls: LMB select | LMB drag multi-select | RMB move/attack/harvest | "
             "S soldier | W worker | R tech | B barracks | D tower | Q battle cry | M music | P pause"
         )
         self._blit_text(controls, 20, MAP_HEIGHT + 122, self.font)
@@ -1080,6 +2023,14 @@ class GameApp:
                 MAP_HEIGHT + 96,
                 self.font,
                 color=COLOR_ALERT,
+            )
+        if self.selected_units:
+            self._blit_text(
+                f"Selected Units: {len(self.selected_units)}",
+                800,
+                MAP_HEIGHT + 122,
+                self.font,
+                color=COLOR_HIGHLIGHT,
             )
         self._draw_messages()
 
@@ -1127,6 +2078,12 @@ class GameApp:
         for node in self.session.nodes:
             if self._distance(pos, (node.x, node.y)) < 16:
                 return node
+        return None
+
+    def _zombie_at_position(self, pos: tuple[int, int]) -> Zombie | None:
+        for zombie in self.session.zombies:
+            if self._distance(pos, (zombie.x, zombie.y)) < 18:
+                return zombie
         return None
 
     def _building_at_position(self, pos: tuple[int, int]) -> bool:
