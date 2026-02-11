@@ -331,6 +331,12 @@ class NationState:
     workers: int = 8
     soldiers: int = 4
     units: list[Unit] = field(default_factory=list)
+    buildings: list[tuple[str, tuple[float, float], float]] = field(default_factory=list)
+    ai_controlled: bool = True
+
+    def update_food_cap(self) -> None:
+        depot_bonus = sum(1 for building in self.buildings if building[0] == "depot") * 6
+        self.resources.food = max(self.resources.food, 12 + depot_bonus)
     ai_controlled: bool = True
     tech_tier: int = 1
     buildings: list["Building"] = field(default_factory=list)
@@ -360,6 +366,9 @@ class NationState:
 
 
 @dataclass
+class GameSession:
+    nations: list[NationState]
+    zombies: list[Zombie]
 class ResourceNode:
     node_id: int
     x: float
@@ -388,6 +397,8 @@ class GameSession:
     selected_nation: int = 0
     minute: float = 0.0
     spawn_timer: float = 0.0
+    game_over: bool = False
+    winner: str | None = None
     build_mode: str | None = None
     messages: list[str] = field(default_factory=list)
     game_over: bool = False
@@ -730,6 +741,30 @@ class GameApp:
                 )
                 session.next_unit_id += 1
             nations.append(nation)
+        return GameSession(nations=nations, zombies=[])
+
+    def _create_resource_nodes(self) -> list[dict]:
+        nodes = []
+        rng = random.Random(12)
+        for _ in range(12):
+            nodes.append(
+                {
+                    "type": "gold",
+                    "x": rng.uniform(100, SCREEN_WIDTH - 100),
+                    "y": rng.uniform(80, MAP_HEIGHT - 80),
+                    "amount": 2000,
+                }
+            )
+        for _ in range(10):
+            nodes.append(
+                {
+                    "type": "lumber",
+                    "x": rng.uniform(120, SCREEN_WIDTH - 120),
+                    "y": rng.uniform(80, MAP_HEIGHT - 80),
+                    "amount": 1500,
+                }
+            )
+        return nodes
         node_id = 0
         for base in base_positions.values():
             for offset, kind in ((-40, "gold"), (40, "lumber")):
